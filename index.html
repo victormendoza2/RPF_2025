@@ -2,13 +2,12 @@
 <html lang="es">
 <head>
   <meta charset="utf-8" />
-  <title>Registro Plantaciones Forestales BPS - Georreferenciación Excel</title>
+  <title>Registro Plantaciones Forestales BPS — Con Titulares (cod_predio)</title>
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
   <link rel="stylesheet" href="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.css"/>
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css"/>
   <style>
-    /* Mantener diseño original - Panel lateral izquierdo */
     html, body { height:100%; margin:0; font-family: Arial, sans-serif; }
     body { display:flex; }
     #panel { width: 360px; min-width: 300px; max-width: 420px; background: #f7f7f7; display:flex; flex-direction:column; border-right:1px solid #e6e6e6; padding-bottom:8px; box-sizing:border-box; }
@@ -32,7 +31,19 @@
     .dot { width:12px; height:12px; border-radius:50%; display:inline-block; border:1px solid rgba(0,0,0,0.1); }
     .label { background: rgba(255,255,255,0.95); padding:4px 6px; border-radius:6px; border:1px solid #ddd; font-size:12px; font-weight:600; }
 
-    /* status */
+    /* estilo para etiqueta de titular */
+    .etiqueta-predio {
+      background: rgba(255,255,255,0.95);
+      border: 1px solid rgba(0,0,0,0.45);
+      padding: 2px 6px;
+      font-size: 12px;
+      font-weight: 600;
+      border-radius: 4px;
+      white-space: nowrap;
+      pointer-events: none;
+      box-shadow: 0 1px 2px rgba(0,0,0,0.15);
+    }
+
     #status-msg {
       position: fixed; top: 12px; left: 50%; transform: translateX(-50%);
       background: rgba(11,107,43,0.95); color: white; padding: 8px 16px;
@@ -46,9 +57,6 @@
     table { width:100%; border-collapse:collapse; font-size:13px; }
     th, td { border:1px solid #e6e6e6; padding:6px; text-align:left; }
     th { background:#f0f0f0; font-weight:700; }
-
-    .downloads { display:flex; gap:6px; flex-wrap:wrap; }
-    .downloads button { flex:1; }
   </style>
 </head>
 <body>
@@ -159,6 +167,7 @@
   const drawnItems = new L.FeatureGroup().addTo(map);
   const trackLayer = L.polyline([], { color:'red', weight:3 }).addTo(map);
   const intersectLayer = new L.FeatureGroup().addTo(map);
+  const labelLayer = new L.FeatureGroup().addTo(map); // etiquetas de titulares
 
   let gpsMarker=null, accuracyCircle=null, watchId=null;
   let gpsVertices=[], trackCoords=[];
@@ -169,7 +178,11 @@
   let intersectFeatures = []; // array of GeoJSON features from MIDAGRI
   let inputPolygonFeature = null; // GeoJSON polygon (lon/lat order), with property area_ha
 
-  // ---------- Draw control (kept) ----------
+  // ---------- tabla de propietarios (csv) ----------
+  // formato: cod_predio -> nombre
+  let propietariosMap = {}; // exactKey -> name
+
+  // ---------- Draw control ----------
   const drawControl = new L.Control.Draw({
     draw:{ polygon:{allowIntersection:false,showArea:true,shapeOptions:{color:'#0b6b2b'}}, marker:true, polyline:false, rectangle:false, circle:false, circlemarker:false },
     edit:{ featureGroup:drawnItems, edit:true, remove:true }
@@ -186,7 +199,7 @@
   });
   map.on(L.Draw.Event.DELETED,()=>{ clearAllLabels(); saveSession(); });
 
-  // ---------- Label area 3 decimals ----------
+  // ---------- Label area ----------
   function addOrUpdateLabel(layer){
     try {
       const gj = layer.toGeoJSON();
@@ -199,8 +212,10 @@
   }
 
   function clearAllLabels(){
+    // remove area labels and titular labels
     map.eachLayer(l => { if(l instanceof L.Marker && l.options.icon?.options?.className === 'label') map.removeLayer(l); });
     drawnItems.eachLayer(l => { if(l._label){ map.removeLayer(l._label); delete l._label; }});
+    labelLayer.clearLayers();
   }
 
   // ---------- GPS ----------
@@ -231,18 +246,21 @@
     const file = e.target.files[0]; if(!file) return;
     const ext = file.name.split('.').pop().toLowerCase();
     const crs = document.getElementById('crs-select').value;
+    // If user uploads propietarios CSV explicitly (filename contains 'propiet') load it as propietarios
+    if(/propiet/i.test(file.name)){
+      loadPropietariosFromFile(file);
+      return;
+    }
     if(ext === 'csv') parseCSV(file, crs); else parseXLSX(file, crs);
   };
 
-  // CSV parser (robust: accepts headers or X/Y fields)
+  // CSV parser (robust)
   function parseCSV(file, crs){
     Papa.parse(file, { header:true, skipEmptyLines:true, complete: r => {
       const rows = r.data;
-      // convert rows to array of [x,y]
       const arr = [];
       rows.forEach(row => {
         const lower = {}; Object.keys(row).forEach(k => lower[k.trim().toLowerCase()] = row[k]);
-        // attempt different names
         const x = parseFloat(lower['este'] ?? lower['x'] ?? lower['lon'] ?? lower['longitud'] ?? lower['longitude'] ?? lower['e'] ?? Object.values(row)[0]);
         const y = parseFloat(lower['norte'] ?? lower['y'] ?? lower['lat'] ?? lower['latitud'] ?? lower['latitude'] ?? lower['n'] ?? Object.values(row)[1]);
         if(!isNaN(x) && !isNaN(y)) arr.push([x,y]);
@@ -251,7 +269,7 @@
     }});
   }
 
-  // XLSX parser: try to find lon/lat columns, otherwise use first two columns
+  // XLSX parser
   function parseXLSX(file, crs){
     const reader = new FileReader();
     reader.onload = e => {
@@ -272,27 +290,23 @@
     reader.readAsBinaryString(file);
   }
 
-  // ---------- Build polygon robustly and display (input rows are [x,y] in input CRS if isArray true) ----------
+  // ---------- Build polygon robustly and display ----------
   function handleRows(rows, crs, isArray=false){
-    uploadedLayer.clearLayers(); intersectLayer.clearLayers(); intersectFeatures = []; inputPolygonFeature = null; document.getElementById('tabla-inter').innerHTML = "Procesando...";
-    const pointsLatLon = []; // will store [lat, lon] for leaflet display (rounded to 3 decimals)
-    // rows may be arrays [x,y] or objects {Este, Norte,...}. We handled that in parsers; here assume arrays of numbers
+    uploadedLayer.clearLayers(); intersectLayer.clearLayers(); labelLayer.clearLayers(); intersectFeatures = []; inputPolygonFeature = null; document.getElementById('tabla-inter').innerHTML = "Procesando...";
+    const pointsLatLon = [];
     rows.forEach(r => {
       if(!r) return;
       let x = r[0], y = r[1];
       if(isNaN(x) || isNaN(y)) return;
-      // convert input CRS to WGS84 lon/lat
       let lonLat;
-      if(crs === '4326') lonLat = [ parseFloat(x), parseFloat(y) ]; // assume x=lon, y=lat when EPSG:4326 input; but earlier code used x=lon,y=lat - be safe
+      if(crs === '4326') lonLat = [ parseFloat(x), parseFloat(y) ];
       else {
         try { lonLat = proj4('EPSG:' + crs, 'EPSG:4326', [x, y]); } catch { lonLat = [x,y]; }
       }
-      // Ensure numbers
       let lon = Number(lonLat[0]); let lat = Number(lonLat[1]);
       if(isNaN(lat) || isNaN(lon)) return;
-      // Round for display to 3 decimals
       const dispLat = lat, dispLon = lon;
-      pointsLatLon.push([dispLat, dispLon]); // [lat, lon] for leaflet
+      pointsLatLon.push([dispLat, dispLon]);
       L.circleMarker([dispLat, dispLon], { radius:5, color:'#007bff', fillColor:'#007bff', fillOpacity:0.9 }).addTo(uploadedLayer);
     });
 
@@ -302,39 +316,27 @@
       return;
     }
 
-    // ensure polygon closed
     const first = pointsLatLon[0], last = pointsLatLon[pointsLatLon.length - 1];
     if(first[0] !== last[0] || first[1] !== last[1]) pointsLatLon.push(first);
 
-    // Create Leaflet polygon using lat/lon order
     const poly = L.polygon(pointsLatLon, { color:'#0056b3', fillOpacity:0.15 }).addTo(uploadedLayer);
     addOrUpdateLabel(poly);
 
-    // Build GeoJSON polygon with coordinates in [lon, lat] order for intersection and download
-    const coordsLonLat = pointsLatLon.map(p => [p[1], p[0]]); // [lon, lat]
-    if(coordsLonLat.length < 4) return; // safety
+    const coordsLonLat = pointsLatLon.map(p => [p[1], p[0]]);
+    if(coordsLonLat.length < 4) return;
     if(coordsLonLat[0][0] !== coordsLonLat[coordsLonLat.length-1][0] || coordsLonLat[0][1] !== coordsLonLat[coordsLonLat.length-1][1]) coordsLonLat.push(coordsLonLat[0]);
 
     const gj = {
       type: 'Feature',
       properties: {},
-      geometry: {
-        type: 'Polygon',
-        coordinates: [ coordsLonLat ]
-      }
+      geometry: { type: 'Polygon', coordinates: [ coordsLonLat ] }
     };
 
-    // compute and attach area_ha
     try { gj.properties.area_ha = parseFloat((turf.area(gj) / 10000).toFixed(2)); } catch(e){ gj.properties.area_ha = 0; }
 
     inputPolygonFeature = gj;
-
-    // zoom to uploaded shape
     map.fitBounds(poly.getBounds().pad(0.12));
-
-    // Now query MIDAGRI
     try { checkIntersection(inputPolygonFeature); } catch(e){ console.error(e); showStatus('Error al consultar MIDAGRI','#d9534f'); }
-
     saveSession();
   }
 
@@ -342,12 +344,13 @@
   const MIDAGRI_LAYER_URL = 'https://georural.midagri.gob.pe/geoservicios/rest/services/public/Catastro_Rural/MapServer/0';
   const midagriLayer = L.esri.featureLayer({ url: MIDAGRI_LAYER_URL });
 
-  // ---------- Intersection: paint and store features ----------
+  // ---------- Intersection: paint and store features + etiquetas ----------
   function checkIntersection(geojsonFeature){
     try {
       if(!geojsonFeature) return;
-      intersectLayer.clearLayers(); intersectFeatures = []; document.getElementById('tabla-inter').innerHTML = "Consultando MIDAGRI...";
+      intersectLayer.clearLayers(); labelLayer.clearLayers(); intersectFeatures = []; document.getElementById('tabla-inter').innerHTML = "Consultando MIDAGRI...";
 
+      // Use esri-leaflet query intersects
       midagriLayer.query().intersects(geojsonFeature).run(function(error, featureCollection){
         if(error){
           console.error("MIDAGRI query error:", error);
@@ -365,17 +368,36 @@
 
         intersectFeatures = features;
 
-        // Paint features in green and add popups
+        // Paint features in green and add popups and etiquetas de titular
         features.forEach(f => {
           const layer = L.geoJSON(f, { style: { color:"#00a94f", weight:2, fillOpacity:0.25 } }).addTo(intersectLayer);
           const props = f.properties || {};
           const id = props.OBJECTID || props.ID || props.OBJECTID_1 || props.oid || "-";
           const area_ha = props.AREA ? (Number(props.AREA)/10000).toFixed(3) : (turf.area(f)/10000).toFixed(3);
+
+          // Build popup with available fields
           let popup = `<div style="font-size:13px"><b>Predio Rural</b><br><b>ID:</b> ${id}<br><b>Área (ha):</b> ${area_ha}<br>`;
-          const extras = ['DEPARTAMEN','DEPARTAMENTO','PROVINCIA','DISTRITO','NOMBRE','CODIGO','TITULAR','PROPietario','PROPIETARI'];
+          const extras = ['DEPARTAMEN','DEPARTAMENTO','PROVINCIA','DISTRITO','NOMBRE','CODIGO','TITULAR','PROPIETARI','cod_predio','COD_PREDIO','CODPREDIO','CODIGO_PRED','COD_PREDIO'];
           extras.forEach(k => { if(props[k]) popup += `<b>${k}:</b> ${props[k]}<br>`; });
           popup += `</div>`;
           layer.bindPopup(popup);
+
+          // Attempt to find titular from propietariosMap using cod_predio property variants
+          const candidateKeys = collectCandidateKeysFromFeature(props);
+          const titular = findTitularForFeature(candidateKeys);
+          if(titular){
+            // label at centroid
+            const cent = turf.centroid(f).geometry.coordinates;
+            L.marker([cent[1], cent[0]], {
+              icon: L.divIcon({
+                className: 'etiqueta-predio',
+                html: titular,
+                iconSize: null
+              })
+            }).addTo(labelLayer);
+            // append to popup
+            layer.bindPopup(popup + `<b>Titular (CSV):</b> ${titular}<br></div>`);
+          }
         });
 
         renderTable(features);
@@ -387,6 +409,48 @@
     }
   }
 
+  // Helper: gather candidate cod_predio values from feature properties
+  function collectCandidateKeysFromFeature(props){
+    const keys = [];
+    // prefer fields that look like cod_predio
+    const possible = ['cod_predio','COD_PREDIO','CODPREDIO','CODIGO_PRED','COD_PREDIO','CODIGO','codigo_predio','num_predio','NUM_PREDIO','NUM'];
+    possible.forEach(k => { if(props[k]) keys.push(String(props[k])); });
+    // also include any textual property that contains underscore patterns (7_...._....)
+    Object.keys(props||{}).forEach(k=>{
+      const v = props[k];
+      if(v && typeof v === 'string' && v.indexOf('_')>=0) keys.push(v);
+    });
+    // normalize whitespace/quotes
+    const normalized = keys.map(k => String(k).trim().replace(/^"+|"+$/g, '').replace(/^'+|'+$/g, ''));
+    const unique = Array.from(new Set(normalized));
+    return unique;
+  }
+
+  // Try to find titular by exact cod_predio match or simple normalized variants
+  function findTitularForFeature(candidateKeys){
+    for(const raw of candidateKeys){
+      if(!raw) continue;
+      const k = raw.trim();
+      if(propietariosMap[k]) return propietariosMap[k];
+      // variant: replace - with _
+      const v1 = k.replace(/-/g, '_');
+      if(propietariosMap[v1]) return propietariosMap[v1];
+      // variant: remove spaces
+      const v2 = k.replace(/\s+/g,'');
+      if(propietariosMap[v2]) return propietariosMap[v2];
+      // variant: remove quotes and trim leading zeros parts (if any)
+      const digitsOnly = k.replace(/['"\s]/g,'');
+      if(propietariosMap[digitsOnly]) return propietariosMap[digitsOnly];
+      // try last segment (sometimes services return only last part)
+      const parts = k.split(/[._-]/).filter(Boolean);
+      if(parts.length>1){
+        const last = parts.slice(-1)[0];
+        if(propietariosMap[last]) return propietariosMap[last];
+      }
+    }
+    return null;
+  }
+
   // ---------- Render table ----------
   function renderTable(features){
     const div = document.getElementById('tabla-inter');
@@ -394,12 +458,15 @@
     const allKeys = new Set();
     features.forEach(f => { Object.keys(f.properties || {}).forEach(k => allKeys.add(k)); });
     const keys = Array.from(allKeys);
+    if(!keys.includes('TITULAR_CSV')) keys.push('TITULAR_CSV');
     let html = "<table><thead><tr>";
     keys.forEach(k => html += `<th>${k}</th>`);
     html += "</tr></thead><tbody>";
     features.forEach(f => {
+      const props = f.properties || {};
+      const titular = findTitularForFeature(collectCandidateKeysFromFeature(props)) || '';
       html += "<tr>";
-      keys.forEach(k => html += `<td>${(f.properties && f.properties[k])? String(f.properties[k]) : ''}</td>`);
+      keys.forEach(k => html += `<td>${(k==='TITULAR_CSV') ? titular : ((props && props[k])? String(props[k]) : '')}</td>`);
       html += "</tr>";
     });
     html += "</tbody></table>";
@@ -420,13 +487,15 @@
     if(!intersectFeatures || intersectFeatures.length === 0){ showStatus('No hay predios para descargar','#d9534f'); return; }
     const rows = intersectFeatures.map(f => {
       const p = f.properties || {};
+      const titular = findTitularForFeature(collectCandidateKeysFromFeature(p)) || p.TITULAR || p.NOMBRE || '';
       return {
         ID: p.OBJECTID || p.ID || p.OBJECTID_1 || "",
+        COD_PREDIO: p.cod_predio || p.COD_PREDIO || '',
         AREA_HA: p.AREA ? (Number(p.AREA)/10000).toFixed(3) : (turf.area(f)/10000).toFixed(3),
         DEPARTAMENTO: p.DEPARTAMEN || p.DEPARTAMENTO || "",
         PROVINCIA: p.PROVINCIA || "",
         DISTRITO: p.DISTRITO || "",
-        TITULAR: p.TITULAR || p.NOMBRE || ""
+        TITULAR: titular
       };
     });
     const csv = Papa.unparse(rows);
@@ -469,12 +538,14 @@
       trackCoords = data.track || [];
       trackLayer.setLatLngs(trackCoords);
     }
+    // Try load propietarios CSV automatically from /data/propietarios.csv
+    loadPropietariosCSVFromRepo();
   });
 
   // ---------- Clear ----------
   document.getElementById('btn-clear').onclick = () => {
     if(!confirm('¿Eliminar todo?')) return;
-    gpsLayer.clearLayers(); drawnItems.clearLayers(); uploadedLayer.clearLayers(); trackLayer.setLatLngs([]); intersectLayer.clearLayers();
+    gpsLayer.clearLayers(); drawnItems.clearLayers(); uploadedLayer.clearLayers(); trackLayer.setLatLngs([]); intersectLayer.clearLayers(); labelLayer.clearLayers();
     gpsVertices=[]; trackCoords=[]; activePolygon=null; lastTrackPoint=null; intersectFeatures=[]; inputPolygonFeature=null;
     if(gpsMarker){ map.removeLayer(gpsMarker); gpsMarker=null; } if(accuracyCircle){ map.removeLayer(accuracyCircle); accuracyCircle=null; }
     clearAllLabels(); infoPrecision.innerText='📡 Precisión: -- m'; localStorage.removeItem("bps_sesion");
@@ -493,7 +564,6 @@
     if(!activePolygon && gpsVertices.length>=3){
       activePolygon = L.polygon(gpsVertices, { color:'#0b6b2b', fillOpacity:0.12 }).addTo(gpsLayer);
       addOrUpdateLabel(activePolygon);
-      // set input polygon and check intersection
       const coordsLonLat = gpsVertices.map(pp => [pp[1], pp[0]]);
       if(coordsLonLat[0][0] !== coordsLonLat[coordsLonLat.length-1][0] || coordsLonLat[0][1] !== coordsLonLat[coordsLonLat.length-1][1]) coordsLonLat.push(coordsLonLat[0]);
       inputPolygonFeature = { type:'Feature', properties:{}, geometry:{ type:'Polygon', coordinates:[coordsLonLat] } };
@@ -511,11 +581,74 @@
     saveSession();
   };
 
+  // ---------- Cargar CSV de propietarios desde repo (ruta /data/propietarios.csv) ----------
+  function loadPropietariosCSVFromRepo(){
+    const repoPath = 'data/propietarios.csv';
+    fetch(repoPath).then(resp=>{
+      if(!resp.ok) throw new Error('HTTP '+resp.status);
+      return resp.text();
+    }).then(txt=>{
+      // Detect delimiter ; or , -> but per your file use ;
+      Papa.parse(txt, { header:true, skipEmptyLines:true, delimiter: detectDelimiter(txt), complete: r=>{
+        const rows = r.data || [];
+        propietariosMap = {};
+        rows.forEach(row=>{
+          // normalize column names: look for cod_predio and nombre (case-insensitive)
+          const lc = {};
+          Object.keys(row).forEach(k => lc[k.trim().toLowerCase()] = row[k]);
+          const nombre = lc['nombre'] ?? lc['name'] ?? lc['titular'] ?? row[Object.keys(row)[1]] ?? '';
+          const cod = lc['cod_predio'] ?? lc['codpredio'] ?? lc['codigo_predio'] ?? lc['cod'] ?? row[Object.keys(row)[0]];
+          if(!cod) return;
+          const raw = String(cod).trim().replace(/^"+|"+$/g,'').replace(/^'+|'+$/g,'');
+          const nm = String(nombre || '').trim();
+          if(raw) propietariosMap[raw] = nm;
+        });
+        console.log('Propietarios cargados', propietariosMap);
+        showStatus('✅ Propietarios cargados desde data/propietarios.csv',  '#0b6b2b', 2500);
+      }});
+    }).catch(err=>{
+      console.warn('No se pudo cargar data/propietarios.csv automáticamente:', err);
+      showStatus('No se encontró data/propietarios.csv — puedes subirlo manualmente', '#d9534f', 3500);
+      setupPropietariosUploadFallback();
+    });
+  }
+
+  function detectDelimiter(txt){
+    // simple heuristic
+    const firstLine = txt.split(/\r?\n/)[0];
+    if((firstLine.match(/;/g)||[]).length > (firstLine.match(/,/g)||[]).length) return ';';
+    return ',';
+  }
+
+  // manual upload fallback for propietarios
+  function setupPropietariosUploadFallback(){
+    document.getElementById('file-input').addEventListener('change', function(e){
+      const file = e.target.files[0];
+      if(!file) return;
+      if(/propiet/i.test(file.name)){
+        loadPropietariosFromFile(file);
+      }
+    });
+  }
+
+  function loadPropietariosFromFile(file){
+    Papa.parse(file, { header:true, skipEmptyLines:true, delimiter: detectDelimiterFromFileName(file.name), complete: r=>{
+      propietariosMap = {};
+      (r.data||[]).forEach(row=>{
+        const lc = {};
+        Object.keys(row).forEach(k => lc[k.trim().toLowerCase()] = row[k]);
+        const nombre = lc['nombre'] ?? lc['name'] ?? row[Object.keys(row)[1]] ?? '';
+        const cod = lc['cod_predio'] ?? lc['codpredio'] ?? lc['cod'] ?? row[Object.keys(row)[0]];
+        if(!cod) return;
+        const raw = String(cod).trim().replace(/^"+|"+$/g,'').replace(/^'+|'+$/g,'');
+        propietariosMap[raw] = String(nombre||'').trim();
+      });
+      showStatus('✅ Propietarios cargados (manual)', '#0b6b2b', 2500);
+    }});
+  }
+  function detectDelimiterFromFileName(name){ return name.indexOf('.csv')>=0 ? ';' : ','; }
+
   // ---------- End ----------
   </script>
 </body>
 </html>
-
-
-
-
