@@ -155,7 +155,7 @@
   proj4.defs("EPSG:32719","+proj=utm +zone=19 +south +datum=WGS84 +units=m +no_defs");
 
   // ---------- MAP, CAPAS, etc. (sin cambios funcionales) ----------
-  const map = L.map('map', { zoomControl:true }).setView([-7.2, -78.5], 8);
+  const map = L.map('map', { zoomControl:true, maxZoom: 22}).setView([-7.2, -78.5], 8);
   const osm = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{attribution:'© OpenStreetMap'}).addTo(map);
   const googleSat = L.tileLayer('https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}',{attribution:'© Google'});
   L.control.layers({"OSM":osm,"Google Satélite":googleSat}).addTo(map);
